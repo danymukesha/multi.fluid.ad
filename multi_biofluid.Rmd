@@ -1,0 +1,1052 @@
+---
+title: "Multi-Biofluid Metabolomics Analysis for Neurodegenerative Diseases"
+subtitle: "Biocrates AbsoluteIDQ p400 Kit Data Analysis"
+author: "Firalis/Lodiag"
+date: "`2024-07-30`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    self_contained: true
+  word_document:
+    toc: true
+  pdf_document:
+    toc: true
+always_allow_html: true
+editor_options:
+  markdown:
+    wrap: 72
+bibliography: references.bib
+---
+
+```{r setup, include=FALSE}
+library(knitr)
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, 
+                      collapse = TRUE, comment = "#>")
+library(ADDIA4Metabo)
+library(dplyr)
+library(readxl)
+
+library(tidyverse)
+library(ggplot2)
+library(pheatmap)
+library(RColorBrewer)
+library(corrplot)
+library(VennDiagram)
+library(FactoMineR)
+library(factoextra)
+library(limma)
+library(ComplexHeatmap)
+library(circlize)
+library(patchwork)
+library(scales)
+library(viridis)
+library(plotly)
+library(ggsci)
+library(ggpubr)
+library(car)
+library(multcomp)
+library(mixOmics)
+```
+
+# 0. DATA IMPORT AND CLEAN
+
+```{r load_data}
+urine <- data.table::fread("metabo_urine.csv") |>
+    dplyr::rename(sample_id = "Sample.identification",
+                  Disease = Dx) |>
+    dplyr::mutate(
+        Disease = case_match(
+            Disease, "mi AD" ~ "miAD",
+            .default = Disease
+      )
+    )
+
+clinical_data <- readxl::read_excel(
+    "../ADDIA4Metabo/data-raw/ADDIA_ST0056_clinical_data_202407.xlsx",
+    skip = 1)
+serum <- data.table::fread("metabo_serum.csv")  |> 
+    dplyr::rename(sample_id = sampleID) |>
+    dplyr::left_join(ADDIA4Metabo::raw_data$id_mapping, 
+                     by = c(sample_id = "New_ID")) |>
+    dplyr::left_join(clinical_data |> 
+                         dplyr::select(Name, `APO-E Firalis`),
+                     by = c("Original_ID" = "Name")) |>
+    dplyr::rename("APOE" = `APO-E Firalis`,
+                  Disease = Allgr, Sex = Gender) |>
+    dplyr::relocate(APOE, .after = Age) |>
+    dplyr::select(-c(Plate, Cohort, Original_ID)) 
+```
+
+```{r theme_publication}
+theme_publication <- theme_minimal() +
+  theme(
+    text = element_text(size = 12, family = "Arial"),
+    axis.title = element_text(size = 14, face = "bold"),
+    axis.text = element_text(size = 11),
+    legend.title = element_text(size = 12, face = "bold"),
+    legend.text = element_text(size = 11),
+    strip.text = element_text(size = 11, face = "bold"),
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    panel.grid.minor = element_blank()
+  )
+
+disease_colors <- c("HC" = "#2E8B57", "miAD" = "#FF6347", "DLB" = "#4169E1")
+biofluid_colors <- c("Urine" = "#8B4513", "Serum" = "#DC143C")
+```
+
+# 1. DATA PREPROCESSING AND QUALITY CONTROL
+
+```{r preprocess_function}
+preprocess_biofluid_data <- function(data, biofluid_name) {
+  cat(sprintf("Processing %s data...\n", biofluid_name))
+  data$Biofluid <- biofluid_name
+ 
+  data$Disease <- case_when(
+    data$Disease %in% c("HC", "Control") ~ "HC",
+    data$Disease %in% c("miAD", "AD", "Alzheimer") ~ "miAD", 
+    data$Disease %in% c("DLB") ~ "DLB",
+    TRUE ~ data$Disease
+  )
+  
+  data$Disease <- factor(data$Disease, levels = c("HC", "miAD", "DLB"))
+  
+  data$Sex <- factor(data$Sex, levels = c("MALE", "FEMALE"))
+  
+  if(biofluid_name == "Serum") {
+    colnames(data) <- gsub("\\.", "(", colnames(data))
+    colnames(data) <- gsub("\\($", ")", colnames(data))
+    colnames(data) <- gsub("\\(([^)]+)\\(", "(\\1:", colnames(data))
+  }
+  
+  return(data)
+}
+```
+
+
+```{r preprocess}
+urine_processed <- preprocess_biofluid_data(urine, "Urine")
+serum_processed <- preprocess_biofluid_data(serum, "Serum")
+```
+
+
+```{r get_columns}
+get_metabolite_columns <- function(data) {
+  metadata_cols <- c("V1", "sample_id", "Disease", "Sex", "Age", "APOE", "Biofluid")
+  metabolite_cols <- setdiff(colnames(data), metadata_cols)
+  return(metabolite_cols)
+}
+
+urine_metabolites <- get_metabolite_columns(urine_processed)
+serum_metabolites <- get_metabolite_columns(serum_processed)
+
+cat(sprintf("Urine metabolites: %d\n", length(urine_metabolites)))
+cat(sprintf("Serum metabolites: %d\n", length(serum_metabolites)))
+```
+
+# 2. DESCRIPTIVE STATISTICS AND SAMPLE CHARACTERISTICS
+
+```{r descriptive}
+generate_sample_summary <- function(data, biofluid_name) {
+  cat(sprintf("\n=== %s Sample Summary ===\n", biofluid_name))
+  
+  disease_summary <- data %>%
+    group_by(Disease) %>%
+    summarise(
+      n = n(),
+      age_mean = mean(Age, na.rm = TRUE),
+      age_sd = sd(Age, na.rm = TRUE),
+      female_n = sum(Sex == "FEMALE", na.rm = TRUE),
+      male_n = sum(Sex == "MALE", na.rm = TRUE),
+      .groups = 'drop'
+    ) %>%
+    mutate(
+      female_percent = round(female_n / (female_n + male_n) * 100, 1),
+      age_summary = sprintf("%.1f ± %.1f", age_mean, age_sd)
+    )
+  
+  print(disease_summary)
+  
+  apoe_summary <- data %>%
+    group_by(Disease, APOE) %>%
+    summarise(n = n(), .groups = 'drop') %>%
+    pivot_wider(names_from = APOE, values_from = n, values_fill = 0)
+  
+  cat("\nAPOE genotype distribution:\n")
+  print(apoe_summary)
+  
+  return(disease_summary)
+}
+
+urine_summary <- generate_sample_summary(urine_processed, "Urine")
+serum_summary <- generate_sample_summary(serum_processed, "Serum")
+```
+
+# 3. METABOLITE CLASSIFICATION AND PATHWAY ANALYSIS
+
+```{r metabolite_class}
+classify_metabolites <- function(metabolite_names) {
+  classification <- tibble(
+    metabolite = metabolite_names,
+    class = case_when(
+      str_detect(metabolite, "^AC\\(") ~ "Acylcarnitines",
+      str_detect(metabolite, "^(Ala|Arg|Asn|Asp|Cit|Gln|Glu|Gly|His|Ile|Lys|Met|Orn|Phe|Pro|Ser|Thr|Trp|Tyr|Val|xLeu)") ~ "Amino Acids",
+      str_detect(metabolite, "^(ADMA|SDMA|Carnosine|Creatinine|Dopamine|Histamine|Kynurenine|Met-SO|PEA|Putrescine|Sarcosine|Serotonin|Spermidine|Spermine|t4-OH-Pro|Taurine|Ac-Orn|alpha-AAA|c4-OH-Pro|AcOrn|Nitro-Tyr|t4.OH.Pro|Serotonine)") ~ "Biogenic Amines",
+      str_detect(metabolite, "^PC") ~ "Phosphatidylcholines",
+      str_detect(metabolite, "^LPC") ~ "Lysophosphatidylcholines", 
+      str_detect(metabolite, "^SM") ~ "Sphingomyelins",
+      str_detect(metabolite, "^Cer") ~ "Ceramides",
+      str_detect(metabolite, "^TG") ~ "Triacylglycerols",
+      str_detect(metabolite, "^DG") ~ "Diacylglycerols",
+      str_detect(metabolite, "^CE") ~ "Cholesteryl Esters",
+      str_detect(metabolite, "Hexose") ~ "Sugars",
+      TRUE ~ "Other"
+    )
+  )
+  return(classification)
+}
+
+urine_classification <- classify_metabolites(urine_metabolites)
+serum_classification <- classify_metabolites(serum_metabolites)
+
+cat("\n=== Metabolite Classification Summary ===\n")
+cat("Urine:\n")
+print(urine_classification %>% count(class, sort = TRUE))
+cat("\nSerum:\n")
+print(serum_classification %>% count(class, sort = TRUE))
+```
+
+# 4. DATA TRANSFORMATION AND NORMALIZATION
+
+```{r data_transformation}
+apply_transformations <- function(data, metabolite_cols) {
+  data_transformed <- data
+  
+  # Log2 transformation for positive values
+  for(col in metabolite_cols) {
+    values <- data[[col]]
+    if(any(values <= 0, na.rm = TRUE)) {
+      min_positive <- min(values[values > 0], na.rm = TRUE)
+      constant <- min_positive / 2
+      values[values <= 0] <- constant
+    }
+    
+    data_transformed[[col]] <- log2(values)
+  }
+  
+  return(data_transformed)
+}
+
+urine_transformed <- apply_transformations(urine_processed, urine_metabolites)
+serum_transformed <- apply_transformations(serum_processed, serum_metabolites)
+```
+
+# 5. UNIVARIATE STATISTICAL ANALYSIS
+
+```{r univariate}
+perform_univariate_analysis <- function(data, metabolite_cols, biofluid_name) {
+  cat(sprintf("\nPerforming univariate analysis for %s...\n", biofluid_name))
+  
+  results <- tibble()
+  
+  for(metabolite in metabolite_cols) {
+    values <- data[[metabolite]]
+    disease <- data$Disease
+    
+    complete_idx <- complete.cases(values, disease)
+    values_clean <- values[complete_idx]
+    disease_clean <- disease[complete_idx]
+    
+    if(length(unique(disease_clean)) < 2) next
+    
+    tryCatch({
+      aov_result <- aov(values_clean ~ disease_clean)
+      aov_summary <- summary(aov_result)
+      
+      overall_p <- aov_summary[[1]][1, "Pr(>F)"]
+      
+      ss_treatment <- aov_summary[[1]][1, "Sum Sq"]
+      ss_total <- sum(aov_summary[[1]][, "Sum Sq"])
+      eta_squared <- ss_treatment / ss_total
+      
+      tukey_result <- TukeyHSD(aov_result)
+      pairwise_p <- tukey_result$disease_clean[, "p adj"]
+      
+      group_stats <- data %>%
+        filter(complete.cases(.[[metabolite]])) %>%
+        group_by(Disease) %>%
+        summarise(
+          mean_val = mean(.data[[metabolite]], na.rm = TRUE),
+          sd_val = sd(.data[[metabolite]], na.rm = TRUE),
+          n = n(),
+          .groups = 'drop'
+        )
+      
+      result_row <- tibble(
+        biofluid = biofluid_name,
+        metabolite = metabolite,
+        overall_p = overall_p,
+        eta_squared = eta_squared,
+        miAD_vs_HC_p = pairwise_p["miAD-HC"],
+        DLB_vs_HC_p = pairwise_p["DLB-HC"], 
+        DLB_vs_miAD_p = pairwise_p["DLB-miAD"]
+      )
+      
+      for(disease_group in group_stats$Disease) {
+        stats <- group_stats %>% filter(Disease == disease_group)
+        result_row[[paste0(disease_group, "_mean")]] <- stats$mean_val
+        result_row[[paste0(disease_group, "_sd")]] <- stats$sd_val
+        result_row[[paste0(disease_group, "_n")]] <- stats$n
+      }
+      
+      results <- bind_rows(results, result_row)
+      
+    }, error = function(e) {
+      cat(sprintf("Error analyzing %s: %s\n", metabolite, e$message))
+    })
+  }
+  
+  if(nrow(results) > 0) {
+    results$overall_p_fdr <- p.adjust(results$overall_p, method = "fdr")
+    results$miAD_vs_HC_p_fdr <- p.adjust(results$miAD_vs_HC_p, method = "fdr")
+    results$DLB_vs_HC_p_fdr <- p.adjust(results$DLB_vs_HC_p, method = "fdr")
+    results$DLB_vs_miAD_p_fdr <- p.adjust(results$DLB_vs_miAD_p, method = "fdr")
+  }
+  
+  return(results)
+}
+
+urine_univariate <- perform_univariate_analysis(urine_transformed, urine_metabolites, "Urine")
+serum_univariate <- perform_univariate_analysis(serum_transformed, serum_metabolites, "Serum")
+
+all_univariate <- bind_rows(urine_univariate, serum_univariate)
+
+significant_metabolites <- all_univariate %>%
+  filter(overall_p_fdr < 0.05) %>%
+  arrange(overall_p_fdr)
+
+cat(sprintf("\nSignificant metabolites (FDR < 0.05): %d\n", nrow(significant_metabolites)))
+print(head(significant_metabolites, 20))
+```
+
+# 6. MULTIVARIATE ANALYSIS - PRINCIPAL COMPONENT ANALYSIS
+
+```{r pca}
+perform_pca_analysis <- function(data, metabolite_cols, biofluid_name) {
+  metabolite_matrix <- data |> dplyr::select(metabolite_cols) 
+  
+  missing_prop <- apply(metabolite_matrix, 2, function(x) sum(is.na(x))/length(x))
+  valid_cols <- names(missing_prop)[missing_prop < 0.3]
+  
+  metabolite_matrix <- metabolite_matrix |> dplyr::select(valid_cols)
+  
+  complete_rows <- complete.cases(metabolite_matrix)
+  metabolite_matrix <- metabolite_matrix[complete_rows, , drop = FALSE]
+  metabolite_matrix <- as.matrix(metabolite_matrix)
+  metabolite_matrix <- metabolite_matrix[, apply(metabolite_matrix, 2, function(x) all(is.finite(x))), drop = FALSE]
+  metadata <- data[complete_rows, c("Disease", "Sex", "Age", "APOE")]
+  
+  pca_result <- PCA(metabolite_matrix, graph = FALSE, scale.unit = TRUE)
+  
+  pca_data <- tibble(
+    PC1 = pca_result$ind$coord[, 1],
+    PC2 = pca_result$ind$coord[, 2],
+    PC3 = pca_result$ind$coord[, 3],
+    Disease = metadata$Disease,
+    Sex = metadata$Sex,
+    Age = metadata$Age,
+    APOE = metadata$APOE,
+    Biofluid = biofluid_name
+  )
+  
+  return(list(pca_result = pca_result, pca_data = pca_data))
+}
+
+urine_pca <- perform_pca_analysis(urine_transformed, urine_metabolites, "Urine")
+serum_pca <- perform_pca_analysis(serum_transformed, serum_metabolites, "Serum")
+```
+
+# 7. PARTIAL LEAST SQUARES DISCRIMINANT ANALYSIS (PLS-DA)
+
+```{r pls-da}
+perform_plsda_analysis <- function(data, metabolite_cols, biofluid_name) {
+  metabolite_matrix <- data |> dplyr::select(metabolite_cols)
+  
+  missing_prop <- apply(metabolite_matrix, 2, function(x) sum(is.na(x))/length(x))
+  valid_cols <- names(missing_prop)[missing_prop < 0.3]
+  
+  metabolite_matrix <- metabolite_matrix |> dplyr::select(valid_cols)
+  
+  complete_rows <- complete.cases(metabolite_matrix)
+  X <- as.matrix(metabolite_matrix[complete_rows, ])
+  Y <- data$Disease[complete_rows]
+  
+  for (i in 1:ncol(X)) {
+      if (any(is.na(X[, i]))) {
+          X[is.na(X[, i]), i] <- median(X[, i], na.rm = TRUE)
+      }
+  }
+  
+  plsda_result <- plsda(X, Y, ncomp = 3)
+  
+  plsda_data <- tibble(
+    Comp1 = plsda_result$variates$X[, 1],
+    Comp2 = plsda_result$variates$X[, 2], 
+    Comp3 = plsda_result$variates$X[, 3],
+    Disease = Y,
+    Biofluid = biofluid_name
+  )
+  
+  return(list(plsda_result = plsda_result, plsda_data = plsda_data))
+}
+
+urine_plsda <- perform_plsda_analysis(urine_transformed, urine_metabolites, "Urine")
+serum_plsda <- perform_plsda_analysis(serum_transformed, serum_metabolites, "Serum")
+```
+
+# 8. VISUALIZATION FUNCTIONS
+
+```{r visualization_functions}
+create_pca_plot <- function(pca_data, title) {
+  ggplot(pca_data, aes(x = PC1, y = PC2, color = Disease, shape = Disease)) +
+    geom_point(size = 3, alpha = 0.7) +
+    stat_ellipse(aes(color = Disease), level = 0.95, linetype = "dashed") +
+    scale_color_manual(values = disease_colors) +
+    scale_shape_manual(values = c(16, 17, 15)) +
+    labs(
+      title = title,
+      x = sprintf("PC1 (%.1f%%)", pca_data$variance_pc1 * 100),
+      y = sprintf("PC2 (%.1f%%)", pca_data$variance_pc2 * 100),
+      color = "Disease Group",
+      shape = "Disease Group"
+    ) +
+    theme_publication +
+    theme(legend.position = "bottom")
+}
+
+create_plsda_plot <- function(plsda_data, title) {
+  ggplot(plsda_data, aes(x = Comp1, y = Comp2, color = Disease, shape = Disease)) +
+    geom_point(size = 3, alpha = 0.7) +
+    stat_ellipse(aes(color = Disease), level = 0.95, linetype = "dashed") +
+    scale_color_manual(values = disease_colors) +
+    scale_shape_manual(values = c(16, 17, 15)) +
+    labs(
+      title = title,
+      x = "Component 1",
+      y = "Component 2", 
+      color = "Disease Group",
+      shape = "Disease Group"
+    ) +
+    theme_publication +
+    theme(legend.position = "bottom")
+}
+
+create_volcano_plot <- function(univariate_results, biofluid_name, comparison = "miAD_vs_HC") {
+  plot_data <- univariate_results %>%
+    filter(biofluid == biofluid_name) %>%
+    mutate(
+      log2_fc = case_when(
+        comparison == "miAD_vs_HC" ~ log2(miAD_mean / HC_mean),
+        comparison == "DLB_vs_HC" ~ log2(DLB_mean / HC_mean),
+        comparison == "DLB_vs_miAD" ~ log2(DLB_mean / miAD_mean)
+      ),
+      neg_log10_p = case_when(
+        comparison == "miAD_vs_HC" ~ -log10(miAD_vs_HC_p_fdr),
+        comparison == "DLB_vs_HC" ~ -log10(DLB_vs_HC_p_fdr), 
+        comparison == "DLB_vs_miAD" ~ -log10(DLB_vs_miAD_p_fdr)
+      ),
+      significance = case_when(
+        neg_log10_p > -log10(0.05) & abs(log2_fc) > 0.5 ~ "Significant",
+        TRUE ~ "Not Significant"
+      )
+    ) %>%
+    filter(!is.na(log2_fc) & !is.na(neg_log10_p) & is.finite(log2_fc) & is.finite(neg_log10_p))
+  
+  ggplot(plot_data, aes(x = log2_fc, y = neg_log10_p, color = significance)) +
+    geom_point(alpha = 0.6, size = 2) +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "red") +
+    geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed", color = "red") +
+    scale_color_manual(values = c("Significant" = "red", "Not Significant" = "gray50")) +
+    labs(
+      title = sprintf("Volcano Plot: %s (%s)", biofluid_name, comparison),
+      x = "Log2 Fold Change",
+      y = "-Log10 FDR P-value",
+      color = "Significance"
+    ) +
+    theme_publication +
+    theme(legend.position = "bottom")
+}
+```
+
+# 9. GENERATE COMPREHENSIVE VISUALIZATIONS
+
+```{r compr_visualizations}
+create_sample_characteristics_plot <- function() {
+  combined_summary <- bind_rows(
+    urine_summary %>% mutate(Biofluid = "Urine"),
+    serum_summary %>% mutate(Biofluid = "Serum")
+  )
+  
+  p1 <- ggplot(combined_summary, aes(x = Disease, y = n, fill = Biofluid)) +
+    geom_col(position = "dodge", alpha = 0.8) +
+    geom_text(aes(label = n), position = position_dodge(width = 0.9), vjust = -0.5) +
+    scale_fill_manual(values = biofluid_colors) +
+    labs(
+      title = "Sample Size Distribution",
+      x = "Disease Group",
+      y = "Number of Samples",
+      fill = "Biofluid"
+    ) +
+    theme_publication
+  
+  combined_age_data <- bind_rows(
+    urine_processed %>% select(Disease, Age) %>% mutate(Biofluid = "Urine"),
+    serum_processed %>% select(Disease, Age) %>% mutate(Biofluid = "Serum")
+  )
+  
+  p2 <- ggplot(combined_age_data, aes(x = Disease, y = Age, fill = Disease)) +
+    geom_boxplot(alpha = 0.7) +
+    facet_wrap(~Biofluid) +
+    scale_fill_manual(values = disease_colors) +
+    labs(
+      title = "Age Distribution by Disease Group",
+      x = "Disease Group",
+      y = "Age (years)",
+      fill = "Disease Group"
+    ) +
+    theme_publication +
+    theme(legend.position = "none")
+  
+  return(list(sample_size = p1, age_dist = p2))
+}
+
+create_multivariate_plots <- function() {
+  urine_pca$pca_data$variance_pc1 <- urine_pca$pca_result$eig[1, 2] / 100
+  urine_pca$pca_data$variance_pc2 <- urine_pca$pca_result$eig[2, 2] / 100
+  serum_pca$pca_data$variance_pc1 <- serum_pca$pca_result$eig[1, 2] / 100  
+  serum_pca$pca_data$variance_pc2 <- serum_pca$pca_result$eig[2, 2] / 100
+  
+  p1 <- create_pca_plot(urine_pca$pca_data, "PCA: Urine Metabolome")
+  p2 <- create_pca_plot(serum_pca$pca_data, "PCA: Serum Metabolome")
+   
+  p3 <- create_plsda_plot(urine_plsda$plsda_data, "PLS-DA: Urine Metabolome")
+  p4 <- create_plsda_plot(serum_plsda$plsda_data, "PLS-DA: Serum Metabolome")
+  
+  return(list(pca_urine = p1, pca_serum = p2, plsda_urine = p3, plsda_serum = p4))
+}
+
+create_volcano_plots <- function() {
+  p1 <- create_volcano_plot(all_univariate, "Urine", "miAD_vs_HC")
+  p2 <- create_volcano_plot(all_univariate, "Serum", "miAD_vs_HC") 
+  p3 <- create_volcano_plot(all_univariate, "Urine", "DLB_vs_HC")
+  p4 <- create_volcano_plot(all_univariate, "Serum", "DLB_vs_HC")
+  
+  return(list(urine_ad = p1, serum_ad = p2, urine_dlb = p3, serum_dlb = p4))
+}
+```
+
+# 10. INTEGRATIVE ANALYSIS ACROSS BIOFLUIDS
+
+```{r integrate_across_biofluids}
+identify_common_metabolites <- function(urine_results, serum_results, fdr_threshold = 0.05) {
+  urine_sig <- urine_results %>%
+    filter(overall_p_fdr < fdr_threshold) %>%
+    pull(metabolite)
+  
+  serum_sig <- serum_results %>%
+    filter(overall_p_fdr < fdr_threshold) %>%
+    pull(metabolite)
+  
+  common_metabolites <- intersect(urine_sig, serum_sig)
+  
+  cat(sprintf("Significant metabolites in urine: %d\n", length(urine_sig)))
+  cat(sprintf("Significant metabolites in serum: %d\n", length(serum_sig)))
+  cat(sprintf("Common significant metabolites: %d\n", length(common_metabolites)))
+  
+  return(list(
+    urine_sig = urine_sig,
+    serum_sig = serum_sig,
+    common = common_metabolites
+  ))
+}
+
+common_sig_metabolites <- identify_common_metabolites(urine_univariate, serum_univariate)
+
+perform_cross_biofluid_correlation <- function() {
+  if(length(common_sig_metabolites$common) == 0) {
+    cat("No common significant metabolites found for correlation analysis.\n")
+    return(NULL)
+  }
+  
+  urine_samples <- urine_processed$sample_id
+  serum_samples <- serum_processed$sample_id  
+  
+  urine_class_means <- urine_transformed %>%
+    select(Disease, all_of(urine_metabolites)) %>%
+    pivot_longer(cols = -Disease, names_to = "metabolite", values_to = "value") %>%
+    left_join(urine_classification, by = "metabolite") %>%
+    group_by(Disease, class) %>%
+    summarise(mean_value = mean(value, na.rm = TRUE), .groups = 'drop') %>%
+    pivot_wider(names_from = class, values_from = mean_value, names_prefix = "Urine_")
+  
+  serum_class_means <- serum_transformed %>%
+    select(Disease, all_of(serum_metabolites)) %>%
+    pivot_longer(cols = -Disease, names_to = "metabolite", values_to = "value") %>%
+    left_join(serum_classification, by = "metabolite") %>%
+    group_by(Disease, class) %>%
+    summarise(mean_value = mean(value, na.rm = TRUE), .groups = 'drop') %>%
+    pivot_wider(names_from = class, values_from = mean_value, names_prefix = "Serum_")
+  
+  correlation_data <- full_join(urine_class_means, serum_class_means, by = "Disease")
+  
+  return(correlation_data)
+}
+
+cross_biofluid_corr <- perform_cross_biofluid_correlation()
+```
+
+# 11. METABOLITE IMPORTANCE AND FEATURE SELECTION
+
+```{r feature_importance}
+get_top_discriminative_metabolites <- function(plsda_result, n_top = 20) {
+  loadings <- plsda_result$loadings$X[, 1:2]
+  
+  # Calculate VIP scores (Variable Importance in Projection)
+  vip_scores <- sqrt(rowSums(loadings^2 * 
+    matrix(rep(plsda_result$prop_expl_var$X[1:2], each = nrow(loadings)), 
+           nrow = nrow(loadings)) * ncol(loadings)))
+  
+  top_metabolites <- tibble(
+    metabolite = rownames(loadings),
+    vip_score = vip_scores,
+    comp1_loading = loadings[, 1],
+    comp2_loading = loadings[, 2]
+  ) %>%
+    arrange(desc(vip_score)) %>%
+    head(n_top)
+  
+  return(top_metabolites)
+}
+
+urine_top_metabolites <- get_top_discriminative_metabolites(urine_plsda$plsda_result)
+serum_top_metabolites <- get_top_discriminative_metabolites(serum_plsda$plsda_result)
+```
+
+# 12. PATHWAY ENRICHMENT ANALYSIS
+
+```{r enrichment}
+# pathway enrichment based on metabolite classes
+perform_pathway_analysis <- function(significant_metabolites, classification_data, biofluid_name) {
+  sig_classification <- classification_data %>%
+    filter(metabolite %in% significant_metabolites) %>%
+    count(class, sort = TRUE)
+  
+  total_classification <- classification_data %>%
+    count(class, name = "total")
+  
+  enrichment_results <- sig_classification %>%
+    left_join(total_classification, by = "class") %>%
+    mutate(
+      biofluid = biofluid_name,
+      proportion_significant = n / sum(n),
+      proportion_total = total / sum(total),
+      enrichment_ratio = proportion_significant / proportion_total,
+      fold_enrichment = (n / (sum(n) - n)) / (total / (sum(total) - total))
+    ) %>%
+    arrange(desc(enrichment_ratio))
+  
+  return(enrichment_results)
+}
+
+urine_pathway_enrichment <- perform_pathway_analysis(
+  common_sig_metabolites$urine_sig, 
+  urine_classification, 
+  "Urine"
+)
+
+serum_pathway_enrichment <- perform_pathway_analysis(
+  common_sig_metabolites$serum_sig,
+  serum_classification,
+  "Serum"
+)
+```
+
+# 13. HEATMAP GENERATION
+
+```{r heatmap}
+create_metabolite_heatmap <- function(data, metabolites, biofluid_name, top_n = 50) {
+  top_metabolites <- metabolites[1:min(top_n, length(metabolites))]
+  
+  heatmap_data <- data %>%
+    select(Disease, all_of(top_metabolites)) %>%
+    group_by(Disease) %>%
+    summarise(across(everything(), ~ mean(.x, na.rm = TRUE)), .groups = 'drop') %>%
+    column_to_rownames("Disease")
+  
+  # Z-score normalization
+  heatmap_matrix <- scale(t(heatmap_data))
+  
+  metabolite_classes <- urine_classification %>%
+    filter(metabolite %in% rownames(heatmap_matrix)) %>%
+    column_to_rownames("metabolite")
+  
+  class_colors <- rainbow(length(unique(metabolite_classes$class)))
+  names(class_colors) <- unique(metabolite_classes$class)
+  
+  annotation_colors <- list(class = class_colors)
+  
+  pheatmap(
+    heatmap_matrix,
+    main = sprintf("Top %d Metabolites - %s", nrow(heatmap_matrix), biofluid_name),
+    annotation_row = metabolite_classes,
+    annotation_colors = annotation_colors,
+    cluster_rows = TRUE,
+    cluster_cols = FALSE,
+    show_rownames = TRUE,
+    show_colnames = TRUE,
+    scale = "none",
+    color = colorRampPalette(c("blue", "white", "red"))(100),
+    fontsize = 8,
+    fontsize_row = 6
+  )
+}
+```
+
+# 14. STATISTICAL SUMMARY AND EXPORT FUNCTIONS
+
+```{r stats_summary}
+create_results_summary <- function() {
+  summary_stats <- tibble(
+    Metric = c(
+      "Urine Samples (n)",
+      "Serum Samples (n)",
+      "Urine Metabolites (n)",
+      "Serum Metabolites (n)",
+      "Urine Significant Metabolites (FDR < 0.05)",
+      "Serum Significant Metabolites (FDR < 0.05)",
+      "Common Significant Metabolites",
+      "HC Urine (n)",
+      "miAD Urine (n)", 
+      "DLB Urine (n)",
+      "HC Serum (n)",
+      "miAD Serum (n)",
+      "DLB Serum (n)"
+    ),
+    Value = c(
+      nrow(urine_processed),
+      nrow(serum_processed),
+      length(urine_metabolites),
+      length(serum_metabolites),
+      length(common_sig_metabolites$urine_sig),
+      length(common_sig_metabolites$serum_sig),
+      length(common_sig_metabolites$common),
+      sum(urine_processed$Disease == "HC", na.rm = TRUE),
+      sum(urine_processed$Disease == "miAD", na.rm = TRUE),
+      sum(urine_processed$Disease == "DLB", na.rm = TRUE),
+      sum(serum_processed$Disease == "HC", na.rm = TRUE),
+      sum(serum_processed$Disease == "miAD", na.rm = TRUE),
+      sum(serum_processed$Disease == "DLB", na.rm = TRUE)
+    )
+  )
+  
+  return(summary_stats)
+}
+
+final_summary <- create_results_summary()
+```
+
+# 15. BIOMARKER PANEL DEVELOPMENT
+
+```{r biomarker_panel}
+develop_biomarker_panels <- function(univariate_results, top_metabolites_list, biofluid_name) {
+  biomarker_candidates <- univariate_results %>%
+    filter(biofluid == biofluid_name & overall_p_fdr < 0.05) %>%
+    arrange(overall_p_fdr) %>%
+    select(metabolite, overall_p_fdr, eta_squared) %>%
+    head(20)
+  
+  # VIP scores from PLS-DA
+  top_metabolites_df <- top_metabolites_list %>%
+    select(metabolite, vip_score)
+  
+  biomarker_panel <- biomarker_candidates %>%
+    left_join(top_metabolites_df, by = "metabolite") %>%
+    mutate(
+      biofluid = biofluid_name,
+      combined_score = scale(1 - overall_p_fdr)[, 1] + 
+                       scale(eta_squared)[, 1] + 
+                       scale(coalesce(vip_score, 0))[, 1]
+    ) %>%
+    arrange(desc(combined_score)) %>%
+    head(10)
+  
+  return(biomarker_panel)
+}
+
+urine_biomarker_panel <- develop_biomarker_panels(all_univariate, urine_top_metabolites, "Urine")
+serum_biomarker_panel <- develop_biomarker_panels(all_univariate, serum_top_metabolites, "Serum")
+```
+
+# 16. CROSS-VALIDATION AND MODEL PERFORMANCE
+
+```{r biomarker_panel}
+# cross-validation for classification
+perform_classification_cv <- function(data, metabolite_cols, biofluid_name, k_folds = 5) {
+  metabolite_matrix <- data[, metabolite_cols, drop = FALSE]
+  
+  # here we remove columns with too many missing values
+  missing_prop <- apply(metabolite_matrix, 2, function(x) sum(is.na(x))/length(x))
+  valid_cols <- names(missing_prop)[missing_prop < 0.3]
+  
+  metabolite_matrix <- metabolite_matrix[, valid_cols, drop = FALSE]
+  
+  # we removed also rows with missing values
+  complete_rows <- complete.cases(metabolite_matrix)
+  X <- as.matrix(metabolite_matrix[complete_rows, ])
+  Y <- data$Disease[complete_rows]
+  
+  # missing values by median imputation
+  for(i in 1:ncol(X)) {
+    if(any(is.na(X[, i]))) {
+      X[is.na(X[, i]), i] <- median(X[, i], na.rm = TRUE)
+    }
+  }
+  
+  # k-fold cross-validation
+  set.seed(123)
+  folds <- sample(rep(1:k_folds, length.out = nrow(X)))
+  
+  cv_results <- tibble()
+  
+  for(fold in 1:k_folds) {
+    train_idx <- folds != fold
+    test_idx <- folds == fold
+    
+    X_train <- X[train_idx, ]
+    Y_train <- Y[train_idx]
+    X_test <- X[test_idx, ]
+    Y_test <- Y[test_idx]
+    
+    tryCatch({
+      plsda_model <- plsda(X_train, Y_train, ncomp = 2)
+      
+      predictions <- predict(plsda_model, X_test)
+      predicted_classes <- predictions$class$max.dist[, 2]
+      
+      accuracy <- sum(predicted_classes == Y_test) / length(Y_test)
+      
+      cv_results <- bind_rows(cv_results, tibble(
+        fold = fold,
+        biofluid = biofluid_name,
+        accuracy = accuracy,
+        n_train = length(Y_train),
+        n_test = length(Y_test)
+      ))
+      
+    }, error = function(e) {
+      cat(sprintf("Error in fold %d: %s\n", fold, e$message))
+    })
+  }
+  
+  cv_summary <- cv_results %>%
+    summarise(
+      biofluid = first(biofluid),
+      mean_accuracy = mean(accuracy, na.rm = TRUE),
+      sd_accuracy = sd(accuracy, na.rm = TRUE),
+      n_folds = n(),
+      .groups = 'drop'
+    )
+  
+  return(list(detailed = cv_results, summary = cv_summary))
+}
+
+urine_cv <- perform_classification_cv(urine_transformed, urine_metabolites, "Urine")
+serum_cv <- perform_classification_cv(serum_transformed, serum_metabolites, "Serum")
+```
+
+# 17. GENERATE FINAL VISUALIZATIONS AND REPORTS
+
+```{r final_visual}
+sample_plots <- create_sample_characteristics_plot()
+multivariate_plots <- create_multivariate_plots()
+volcano_plots <- create_volcano_plots()
+
+cat("\n" + "="*80 + "\n")
+cat("COMPREHENSIVE MULTI-BIOFLUID METABOLOMICS ANALYSIS SUMMARY\n")
+cat("="*80 + "\n")
+print(final_summary)
+
+cat("\n=== CROSS-VALIDATION RESULTS ===\n")
+print(bind_rows(urine_cv$summary, serum_cv$summary))
+
+cat("\n=== TOP BIOMARKER CANDIDATES ===\n")
+cat("Urine:\n")
+print(urine_biomarker_panel %>% select(metabolite, overall_p_fdr, eta_squared, vip_score, combined_score))
+cat("\nSerum:\n") 
+print(serum_biomarker_panel %>% select(metabolite, overall_p_fdr, eta_squared, vip_score, combined_score))
+
+cat("\n=== PATHWAY ENRICHMENT RESULTS ===\n")
+cat("Urine:\n")
+print(urine_pathway_enrichment)
+cat("\nSerum:\n")
+print(serum_pathway_enrichment)
+```
+
+# 18. EXPORT RESULTS FOR PUBLICATION
+
+```{r final_visual}
+export_results <- function() {
+  if(!dir.exists("metabolomics_results")) {
+    dir.create("metabolomics_results")
+  }
+  
+  # statistical results
+  write_csv(all_univariate, "metabolomics_results/univariate_analysis_results.csv")
+  write_csv(significant_metabolites, "metabolomics_results/significant_metabolites.csv")
+  write_csv(bind_rows(urine_biomarker_panel, serum_biomarker_panel), 
+            "metabolomics_results/biomarker_panels.csv")
+  write_csv(bind_rows(urine_pathway_enrichment, serum_pathway_enrichment),
+            "metabolomics_results/pathway_enrichment.csv")
+  write_csv(final_summary, "metabolomics_results/analysis_summary.csv")
+  
+  # PCA/PLS-DA results
+  write_csv(bind_rows(urine_pca$pca_data, serum_pca$pca_data), 
+            "metabolomics_results/pca_scores.csv")
+  write_csv(bind_rows(urine_plsda$plsda_data, serum_plsda$plsda_data),
+            "metabolomics_results/plsda_scores.csv")
+  
+  # cross-validation results
+  write_csv(bind_rows(urine_cv$detailed, serum_cv$detailed),
+            "metabolomics_results/cross_validation_results.csv")
+  
+  cat("Results exported to 'metabolomics_results' directory\n")
+}
+
+export_results()
+```
+
+# 19. CREATE PUBLICATION-READY FIGURES
+
+```{r pub_ready_figures}
+# Figure 1: Study overview and sample characteristics
+create_figure1 <- function() {
+  fig1 <- (sample_plots$sample_size / sample_plots$age_dist) +
+    plot_annotation(
+      title = "Figure 1: Study Design and Sample Characteristics",
+      subtitle = "Multi-biofluid metabolomics analysis of neurodegenerative diseases",
+      tag_levels = 'A'
+    )
+  
+  ggsave("metabolomics_results/Figure1_Sample_Characteristics.pdf", 
+         fig1, width = 12, height = 8, dpi = 300)
+  ggsave("metabolomics_results/Figure1_Sample_Characteristics.png", 
+         fig1, width = 12, height = 8, dpi = 300)
+  
+  return(fig1)
+}
+
+# Figure 2: Multivariate analysis
+create_figure2 <- function() {
+  fig2 <- (multivariate_plots$pca_urine + multivariate_plots$pca_serum) /
+          (multivariate_plots$plsda_urine + multivariate_plots$plsda_serum) +
+    plot_annotation(
+      title = "Figure 2: Multivariate Analysis of Metabolomic Profiles",
+      subtitle = "PCA and PLS-DA reveal biofluid-specific metabolic signatures",
+      tag_levels = 'A'
+    )
+  
+  ggsave("metabolomics_results/Figure2_Multivariate_Analysis.pdf",
+         fig2, width = 16, height = 12, dpi = 300)
+  ggsave("metabolomics_results/Figure2_Multivariate_Analysis.png",
+         fig2, width = 16, height = 12, dpi = 300)
+  
+  return(fig2)
+}
+
+# Figure 3: Differential metabolite analysis
+create_figure3 <- function() {
+  fig3 <- (volcano_plots$urine_ad + volcano_plots$serum_ad) /
+          (volcano_plots$urine_dlb + volcano_plots$serum_dlb) +
+    plot_annotation(
+      title = "Figure 3: Differential Metabolite Analysis",
+      subtitle = "Volcano plots showing disease-associated metabolic alterations",
+      tag_levels = 'A'
+    )
+  
+  ggsave("metabolomics_results/Figure3_Volcano_Plots.pdf",
+         fig3, width = 16, height = 12, dpi = 300)
+  ggsave("metabolomics_results/Figure3_Volcano_Plots.png", 
+         fig3, width = 16, height = 12, dpi = 300)
+  
+  return(fig3)
+}
+
+figure1 <- create_figure1()
+figure2 <- create_figure2()  
+figure3 <- create_figure3()
+```
+
+# 20. FINAL ANALYSIS SUMMARY AND INTERPRETATION
+
+```{r final_summary}
+generate_final_report <- function() {
+  report <- paste0(
+    "COMPREHENSIVE MULTI-BIOFLUID METABOLOMICS ANALYSIS\n",
+    "Biocrates AbsoluteIDQ p400 Kit Analysis\n",
+    "Date: ", Sys.Date(), "\n\n",
+    
+    "STUDY OVERVIEW:\n",
+    "- Disease groups: HC (Healthy Controls), miAD (mild Alzheimer's Disease), DLB (Dementia with Lewy Bodies)\n",
+    "- Biofluids analyzed: Urine and Serum\n",
+    "- Total samples: ", nrow(urine_processed) + nrow(serum_processed), "\n",
+    "- Total unique metabolites: ", length(unique(c(urine_metabolites, serum_metabolites))), "\n\n",
+    
+    "KEY FINDINGS:\n",
+    "1. Significant metabolites (FDR < 0.05):\n",
+    "   - Urine: ", length(common_sig_metabolites$urine_sig), " metabolites\n",
+    "   - Serum: ", length(common_sig_metabolites$serum_sig), " metabolites\n",
+    "   - Common across biofluids: ", length(common_sig_metabolites$common), " metabolites\n\n",
+    
+    "2. Classification performance (cross-validation):\n",
+    "   - Urine accuracy: ", sprintf("%.2f ± %.2f", urine_cv$summary$mean_accuracy, urine_cv$summary$sd_accuracy), "\n",
+    "   - Serum accuracy: ", sprintf("%.2f ± %.2f", serum_cv$summary$mean_accuracy, serum_cv$summary$sd_accuracy), "\n\n",
+    
+    "3. Top enriched metabolite classes:\n",
+    "   - Urine: ", paste(head(urine_pathway_enrichment$class, 3), collapse = ", "), "\n",
+    "   - Serum: ", paste(head(serum_pathway_enrichment$class, 3), collapse = ", "), "\n\n",
+    
+    "BIOMARKER PANELS:\n",
+    "Top 5 urine biomarkers: ", paste(head(urine_biomarker_panel$metabolite, 5), collapse = ", "), "\n",
+    "Top 5 serum biomarkers: ", paste(head(serum_biomarker_panel$metabolite, 5), collapse = ", "), "\n\n",
+    
+    "STATISTICAL METHODS:\n",
+    "- Data transformation: Log2 transformation\n",
+    "- Univariate analysis: ANOVA with Tukey post-hoc tests\n",
+    "- Multiple testing correction: False Discovery Rate (FDR)\n",
+    "- Multivariate analysis: PCA and PLS-DA\n",
+    "- Cross-validation: 5-fold cross-validation\n",
+    "- Effect size: Eta-squared\n",
+    "- Variable importance: VIP scores from PLS-DA\n\n",
+    
+    "FILES GENERATED:\n",
+    "- Statistical results: univariate_analysis_results.csv\n",
+    "- Significant metabolites: significant_metabolites.csv\n",
+    "- Biomarker panels: biomarker_panels.csv\n",
+    "- Pathway enrichment: pathway_enrichment.csv\n",
+    "- Multivariate scores: pca_scores.csv, plsda_scores.csv\n",
+    "- Publication figures: Figure1-3 (PDF and PNG formats)\n"
+  )
+  
+  writeLines(report, "metabolomics_results/Analysis_Report.txt")
+  cat(report)
+}
+
+generate_final_report()
+
+cat("\n" + "="*80 + "\n")
+cat("ANALYSIS COMPLETED SUCCESSFULLY!\n")
+cat("All results, figures, and reports have been generated.\n")
+cat("Check the 'metabolomics_results' directory for all output files.\n")
+cat("="*80 + "\n")
+```
