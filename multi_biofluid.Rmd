@@ -1,7 +1,7 @@
 ---
 title: "Multi-Biofluid Metabolomics Analysis for Neurodegenerative Diseases"
 subtitle: "Biocrates AbsoluteIDQ p400 Kit Data Analysis"
-author: "Firalis/Lodiag"
+author: "Dany Mukesha"
 date: "`2024-07-30`"
 output:
   html_document:
@@ -1050,3 +1050,4 @@ cat("All results, figures, and reports have been generated.\n")
 cat("Check the 'metabolomics_results' directory for all output files.\n")
 cat("="*80 + "\n")
 ```
+
